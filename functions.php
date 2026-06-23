@@ -1820,3 +1820,215 @@ add_action('wp_head', function () {
     </style>
     <?php
 }, 999);
+/**
+ * Динамический расчет стоимости печатной продукции через n8n.
+ */
+define('MYPRINTLAB_PRINT_PRICE_WEBHOOK_URL', 'https://n8n.denkolapi.ru/webhook/817978ff-18b5-45d2-a6ba-a1a436e39c6e');
+
+add_action('wp_enqueue_scripts', function () {
+	if (!function_exists('is_product') || !is_product()) {
+		return;
+	}
+
+	wp_register_script('myprintlab-print-price-calculator', false, array('jquery'), null, true);
+	wp_enqueue_script('myprintlab-print-price-calculator');
+
+	wp_localize_script('myprintlab-print-price-calculator', 'myprintlabPrintPrice', array(
+		'ajaxUrl' => admin_url('admin-ajax.php'),
+		'nonce'   => wp_create_nonce('myprintlab_print_price'),
+	));
+
+	$script = <<<'JS'
+(function ($) {
+	'use strict';
+
+	var requestTimer = null;
+	var activeRequest = null;
+	var lastPayloadHash = '';
+	var priceSelector = '.summary .price, .product-image-summary-wrap .price, .wd-single-price .price, .woocommerce-variation-price .price';
+
+	function getProductForm($changedElement) {
+		var $form = $changedElement.closest('form.cart, form.variations_form, form');
+
+		if (!$form.length) {
+			$form = $('form.cart, form.variations_form').first();
+		}
+
+		return $form;
+	}
+
+	function collectFormData($form) {
+		var values = {};
+
+		$form.find('input, select, textarea').each(function () {
+			var field = this;
+			var $field = $(field);
+			var name = $field.attr('name');
+
+			if (!name || field.disabled || name === 'add-to-cart') {
+				return;
+			}
+
+			if ((field.type === 'checkbox' || field.type === 'radio') && !field.checked) {
+				return;
+			}
+
+			if (name.indexOf('[]') !== -1) {
+				name = name.replace('[]', '');
+				if (!Array.isArray(values[name])) {
+					values[name] = [];
+				}
+				values[name].push($field.val());
+				return;
+			}
+
+			values[name] = $field.val();
+		});
+
+		var bodyPostId = $('body').attr('class').match(/postid-(\d+)/);
+		values.product_id = values.product_id || $form.find('[name="add-to-cart"]').val() || (bodyPostId ? bodyPostId[1] : '') || '';
+		values.quantity = values.quantity || $form.find('[name="quantity"]').val() || 1;
+		values.page_url = window.location.href;
+
+		return values;
+	}
+
+	function setLoading($form, isLoading) {
+		$form.toggleClass('myprintlab-price-is-loading', isLoading);
+		$(priceSelector).first().toggleClass('myprintlab-price-is-loading', isLoading);
+	}
+
+	function renderPrice(response) {
+		if (!response || !response.success || !response.data || !response.data.price_html) {
+			return;
+		}
+
+		var $price = $(priceSelector).filter(':visible').first();
+
+		if (!$price.length) {
+			$price = $(priceSelector).first();
+		}
+
+		$price.html(response.data.price_html);
+	}
+
+	function requestPrice($form) {
+		var payload = collectFormData($form);
+		var payloadHash = JSON.stringify(payload);
+
+		if (payloadHash === lastPayloadHash) {
+			return;
+		}
+
+		lastPayloadHash = payloadHash;
+
+		if (activeRequest) {
+			activeRequest.abort();
+		}
+
+		setLoading($form, true);
+
+		activeRequest = $.ajax({
+			url: myprintlabPrintPrice.ajaxUrl,
+			method: 'POST',
+			dataType: 'json',
+			data: {
+				action: 'myprintlab_calculate_print_price',
+				nonce: myprintlabPrintPrice.nonce,
+				payload: JSON.stringify(payload)
+			}
+		}).done(renderPrice).always(function () {
+			activeRequest = null;
+			setLoading($form, false);
+		});
+	}
+
+	function schedulePriceRequest(event) {
+		var $form = getProductForm($(event.target));
+
+		if (!$form.length) {
+			return;
+		}
+
+		window.clearTimeout(requestTimer);
+		requestTimer = window.setTimeout(function () {
+			requestPrice($form);
+		}, 350);
+	}
+
+	$(document).on('change input', 'form.cart input, form.cart select, form.cart textarea, form.variations_form input, form.variations_form select, form.variations_form textarea', schedulePriceRequest);
+	$(document).on('found_variation reset_data woocommerce_variation_has_changed', 'form.variations_form', schedulePriceRequest);
+})(jQuery);
+JS;
+
+	wp_add_inline_script('myprintlab-print-price-calculator', $script);
+
+	wp_register_style('myprintlab-print-price-calculator', false);
+	wp_enqueue_style('myprintlab-print-price-calculator');
+	wp_add_inline_style('myprintlab-print-price-calculator', '.myprintlab-price-is-loading{opacity:.55;position:relative}.myprintlab-price-is-loading:after{content:"Расчет...";display:inline-block;margin-left:8px;font-size:13px;color:#6b7280}');
+});
+
+add_action('wp_ajax_myprintlab_calculate_print_price', 'myprintlab_calculate_print_price');
+add_action('wp_ajax_nopriv_myprintlab_calculate_print_price', 'myprintlab_calculate_print_price');
+
+function myprintlab_calculate_print_price() {
+	check_ajax_referer('myprintlab_print_price', 'nonce');
+
+	$payload = isset($_POST['payload']) ? wp_unslash($_POST['payload']) : '';
+	$data = json_decode($payload, true);
+
+	if (!is_array($data)) {
+		wp_send_json_error(array('message' => 'Некорректные параметры расчета.'), 400);
+	}
+
+	$response = wp_remote_post(MYPRINTLAB_PRINT_PRICE_WEBHOOK_URL, array(
+		'timeout' => 12,
+		'headers' => array(
+			'Content-Type' => 'application/json; charset=utf-8',
+		),
+		'body' => wp_json_encode(array(
+			'source' => 'woocommerce_product_page',
+			'payload' => $data,
+		)),
+	));
+
+	if (is_wp_error($response)) {
+		wp_send_json_error(array('message' => $response->get_error_message()), 502);
+	}
+
+	$body = wp_remote_retrieve_body($response);
+	$decoded = json_decode($body, true);
+	$price = null;
+
+	if (is_array($decoded)) {
+		if (!empty($decoded['price_html'])) {
+			wp_send_json_success(array(
+				'price' => $decoded['price'] ?? null,
+				'price_html' => wp_kses_post($decoded['price_html']),
+				'raw' => $decoded,
+			));
+		}
+
+		$price = $decoded['price'] ?? $decoded['total'] ?? $decoded['amount'] ?? null;
+	} elseif (is_numeric(trim($body))) {
+		$price = trim($body);
+	}
+
+	if (null === $price || '' === $price) {
+		wp_send_json_success(array(
+			'price' => null,
+			'price_html' => '',
+			'raw' => $decoded ?: $body,
+		));
+	}
+
+	$numeric_price = is_string($price) ? preg_replace('/[^0-9,.]/', '', $price) : $price;
+	$numeric_price = is_string($numeric_price) ? str_replace(',', '.', $numeric_price) : $numeric_price;
+	$price_html = function_exists('wc_price') && is_numeric($numeric_price) ? wc_price((float) $numeric_price) : esc_html((string) $price);
+
+	wp_send_json_success(array(
+		'price' => $price,
+		'price_html' => $price_html,
+		'raw' => $decoded ?: $body,
+	));
+}
