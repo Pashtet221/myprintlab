@@ -1898,18 +1898,51 @@ add_action('wp_enqueue_scripts', function () {
 		$(priceSelector).first().toggleClass('myprintlab-price-is-loading', isLoading);
 	}
 
-	function renderPrice(response) {
-		if (!response || !response.success || !response.data || !response.data.price_html) {
-			return;
-		}
-
+	function getPriceElement() {
 		var $price = $(priceSelector).filter(':visible').first();
 
 		if (!$price.length) {
 			$price = $(priceSelector).first();
 		}
 
+		return $price;
+	}
+
+	function showPriceMessage(message, isError) {
+		var $price = getPriceElement();
+
+		if (!$price.length) {
+			return;
+		}
+
+		var $message = $('.myprintlab-price-message');
+
+		if (!$message.length) {
+			$message = $('<div class="myprintlab-price-message" aria-live="polite"></div>');
+			$price.after($message);
+		}
+
+		$message
+			.toggleClass('myprintlab-price-message--error', !!isError)
+			.text(message || '')
+			.toggle(!!message);
+	}
+
+	function renderPrice(response) {
+		if (!response || !response.success || !response.data || !response.data.price_html) {
+			var message = response && response.data && response.data.message ? response.data.message : 'Не удалось получить актуальную стоимость.';
+			showPriceMessage(message, true);
+			return;
+		}
+
+		var $price = getPriceElement();
+
+		if (!$price.length) {
+			return;
+		}
+
 		$price.html(response.data.price_html);
+		showPriceMessage('', false);
 	}
 
 	function requestPrice($form) {
@@ -1937,7 +1970,10 @@ add_action('wp_enqueue_scripts', function () {
 				nonce: myprintlabPrintPrice.nonce,
 				payload: JSON.stringify(payload)
 			}
-		}).done(renderPrice).always(function () {
+		}).done(renderPrice).fail(function (xhr) {
+			var message = xhr && xhr.responseJSON && xhr.responseJSON.data && xhr.responseJSON.data.message ? xhr.responseJSON.data.message : 'Не удалось получить актуальную стоимость.';
+			showPriceMessage(message, true);
+		}).always(function () {
 			activeRequest = null;
 			setLoading($form, false);
 		});
@@ -1958,6 +1994,16 @@ add_action('wp_enqueue_scripts', function () {
 
 	$(document).on('change input', 'form.cart input, form.cart select, form.cart textarea, form.variations_form input, form.variations_form select, form.variations_form textarea', schedulePriceRequest);
 	$(document).on('found_variation reset_data woocommerce_variation_has_changed', 'form.variations_form', schedulePriceRequest);
+
+	$(function () {
+		var $form = $('form.cart, form.variations_form').first();
+
+		if ($form.length) {
+			window.setTimeout(function () {
+				requestPrice($form);
+			}, 450);
+		}
+	});
 })(jQuery);
 JS;
 
@@ -1965,7 +2011,7 @@ JS;
 
 	wp_register_style('myprintlab-print-price-calculator', false);
 	wp_enqueue_style('myprintlab-print-price-calculator');
-	wp_add_inline_style('myprintlab-print-price-calculator', '.myprintlab-price-is-loading{opacity:.55;position:relative}.myprintlab-price-is-loading:after{content:"Расчет...";display:inline-block;margin-left:8px;font-size:13px;color:#6b7280}');
+	wp_add_inline_style('myprintlab-print-price-calculator', '.myprintlab-price-is-loading{opacity:.55;position:relative}.myprintlab-price-is-loading:after{content:"Расчет...";display:inline-block;margin-left:8px;font-size:13px;color:#6b7280}.myprintlab-price-message{display:none;margin-top:8px;font-size:13px;line-height:1.4;color:#6b7280}.myprintlab-price-message--error{color:#b42318}');
 });
 
 add_action('wp_ajax_myprintlab_calculate_print_price', 'myprintlab_calculate_print_price');
@@ -1998,28 +2044,30 @@ function myprintlab_calculate_print_price() {
 
 	$body = wp_remote_retrieve_body($response);
 	$decoded = json_decode($body, true);
-	$price = null;
+	$result = myprintlab_extract_price_from_webhook_response(null === $decoded ? $body : $decoded);
 
-	if (is_array($decoded)) {
-		if (!empty($decoded['price_html'])) {
-			wp_send_json_success(array(
-				'price' => $decoded['price'] ?? null,
-				'price_html' => wp_kses_post($decoded['price_html']),
-				'raw' => $decoded,
-			));
-		}
-
-		$price = $decoded['price'] ?? $decoded['total'] ?? $decoded['amount'] ?? null;
-	} elseif (is_numeric(trim($body))) {
-		$price = trim($body);
+	if (!empty($result['error'])) {
+		wp_send_json_error(array(
+			'message' => $result['error'],
+			'raw' => $decoded ?: $body,
+		), 502);
 	}
 
-	if (null === $price || '' === $price) {
+	if (!empty($result['price_html'])) {
 		wp_send_json_success(array(
-			'price' => null,
-			'price_html' => '',
+			'price' => $result['price'],
+			'price_html' => wp_kses_post($result['price_html']),
 			'raw' => $decoded ?: $body,
 		));
+	}
+
+	$price = $result['price'];
+
+	if (null === $price || '' === $price) {
+		wp_send_json_error(array(
+			'message' => 'Webhook не вернул цену. Ожидаются поля price_html, price, total или amount.',
+			'raw' => $decoded ?: $body,
+		), 502);
 	}
 
 	$numeric_price = is_string($price) ? preg_replace('/[^0-9,.]/', '', $price) : $price;
@@ -2031,4 +2079,92 @@ function myprintlab_calculate_print_price() {
 		'price_html' => $price_html,
 		'raw' => $decoded ?: $body,
 	));
+}
+
+function myprintlab_extract_price_from_webhook_response($response) {
+	if (is_string($response)) {
+		$trimmed = trim($response);
+
+		if ('' === $trimmed) {
+			return array(
+				'price' => null,
+				'price_html' => '',
+				'error' => 'Webhook вернул пустой ответ.',
+			);
+		}
+
+		if (is_numeric($trimmed)) {
+			return array(
+				'price' => $trimmed,
+				'price_html' => '',
+				'error' => '',
+			);
+		}
+
+		return array(
+			'price' => null,
+			'price_html' => '',
+			'error' => $trimmed,
+		);
+	}
+
+	if (!is_array($response)) {
+		return array(
+			'price' => null,
+			'price_html' => '',
+			'error' => 'Webhook вернул неподдерживаемый формат ответа.',
+		);
+	}
+
+	foreach (array('price_html', 'priceHtml', 'formatted_price', 'formattedPrice') as $html_key) {
+		if (!empty($response[$html_key])) {
+			return array(
+				'price' => $response['price'] ?? $response['total'] ?? $response['amount'] ?? null,
+				'price_html' => (string) $response[$html_key],
+				'error' => '',
+			);
+		}
+	}
+
+	foreach (array('price', 'total', 'amount', 'sum', 'value') as $price_key) {
+		if (isset($response[$price_key]) && '' !== $response[$price_key]) {
+			return array(
+				'price' => $response[$price_key],
+				'price_html' => '',
+				'error' => '',
+			);
+		}
+	}
+
+	foreach (array('data', 'result', 'body', 'json', 'output') as $nested_key) {
+		if (isset($response[$nested_key])) {
+			$nested_result = myprintlab_extract_price_from_webhook_response($response[$nested_key]);
+
+			if (empty($nested_result['error']) && (null !== $nested_result['price'] || '' !== $nested_result['price_html'])) {
+				return $nested_result;
+			}
+		}
+	}
+
+	if (isset($response[0])) {
+		$first_result = myprintlab_extract_price_from_webhook_response($response[0]);
+
+		if (empty($first_result['error']) && (null !== $first_result['price'] || '' !== $first_result['price_html'])) {
+			return $first_result;
+		}
+	}
+
+	if (!empty($response['message'])) {
+		return array(
+			'price' => null,
+			'price_html' => '',
+			'error' => (string) $response['message'],
+		);
+	}
+
+	return array(
+		'price' => null,
+		'price_html' => '',
+		'error' => 'Webhook не вернул цену. Ожидаются поля price_html, price, total или amount.',
+	);
 }
