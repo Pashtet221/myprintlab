@@ -1823,7 +1823,9 @@ add_action('wp_head', function () {
 /**
  * Динамический расчет стоимости печатной продукции через n8n.
  */
-define('MYPRINTLAB_PRINT_PRICE_WEBHOOK_URL', 'https://n8n.denkolapi.ru/webhook/817978ff-18b5-45d2-a6ba-a1a436e39c6e');
+if (!defined('MYPRINTLAB_PRINT_PRICE_WEBHOOK_URL')) {
+	define('MYPRINTLAB_PRINT_PRICE_WEBHOOK_URL', 'https://n8n.denkolapi.ru/webhook/817978ff-18b5-45d2-a6ba-a1a436e39c6e');
+}
 
 add_action('wp_enqueue_scripts', function () {
 	if (!function_exists('is_product') || !is_product()) {
@@ -1971,6 +1973,7 @@ add_action('wp_enqueue_scripts', function () {
 				payload: JSON.stringify(payload)
 			}
 		}).done(renderPrice).fail(function (xhr) {
+			lastPayloadHash = '';
 			var message = xhr && xhr.responseJSON && xhr.responseJSON.data && xhr.responseJSON.data.message ? xhr.responseJSON.data.message : 'Не удалось получить актуальную стоимость.';
 			showPriceMessage(message, true);
 		}).always(function () {
@@ -1995,15 +1998,10 @@ add_action('wp_enqueue_scripts', function () {
 	$(document).on('change input', 'form.cart input, form.cart select, form.cart textarea, form.variations_form input, form.variations_form select, form.variations_form textarea', schedulePriceRequest);
 	$(document).on('found_variation reset_data woocommerce_variation_has_changed', 'form.variations_form', schedulePriceRequest);
 
-	$(function () {
-		var $form = $('form.cart, form.variations_form').first();
-
-		if ($form.length) {
-			window.setTimeout(function () {
-				requestPrice($form);
-			}, 450);
-		}
-	});
+	// Не дергаем webhook сразу при загрузке карточки: на первом рендере
+	// параметры могут быть еще не выбраны, а n8n в таком случае возвращает 500.
+	// Расчет запускается только после изменения пользователем полей товара
+	// или события WooCommerce о подобранной вариации.
 })(jQuery);
 JS;
 
@@ -2027,7 +2025,13 @@ function myprintlab_calculate_print_price() {
 		wp_send_json_error(array('message' => 'Некорректные параметры расчета.'), 400);
 	}
 
-	$response = wp_remote_post(MYPRINTLAB_PRINT_PRICE_WEBHOOK_URL, array(
+	$webhook_url = apply_filters('myprintlab_print_price_webhook_url', MYPRINTLAB_PRINT_PRICE_WEBHOOK_URL, $data);
+
+	if (empty($webhook_url) || !wp_http_validate_url($webhook_url)) {
+		wp_send_json_error(array('message' => 'Некорректный URL webhook для расчета стоимости.'), 500);
+	}
+
+	$response = wp_remote_post($webhook_url, array(
 		'timeout' => 12,
 		'headers' => array(
 			'Content-Type' => 'application/json; charset=utf-8',
@@ -2042,7 +2046,16 @@ function myprintlab_calculate_print_price() {
 		wp_send_json_error(array('message' => $response->get_error_message()), 502);
 	}
 
+	$status_code = wp_remote_retrieve_response_code($response);
 	$body = wp_remote_retrieve_body($response);
+
+	if (200 > $status_code || 300 <= $status_code) {
+		wp_send_json_error(array(
+			'message' => sprintf('Webhook вернул HTTP %d. Проверьте сценарий расчета.', $status_code),
+			'raw' => $body,
+		), 502);
+	}
+
 	$decoded = json_decode($body, true);
 	$result = myprintlab_extract_price_from_webhook_response(null === $decoded ? $body : $decoded);
 
@@ -2116,7 +2129,7 @@ function myprintlab_extract_price_from_webhook_response($response) {
 		);
 	}
 
-	foreach (array('price_html', 'priceHtml', 'formatted_price', 'formattedPrice') as $html_key) {
+	foreach (array('price_html', 'priceHtml', 'formatted_price', 'formattedPrice', 'formattedAmount', 'formatted_amount') as $html_key) {
 		if (!empty($response[$html_key])) {
 			return array(
 				'price' => $response['price'] ?? $response['total'] ?? $response['amount'] ?? null,
@@ -2126,7 +2139,7 @@ function myprintlab_extract_price_from_webhook_response($response) {
 		}
 	}
 
-	foreach (array('price', 'total', 'amount', 'sum', 'value') as $price_key) {
+	foreach (array('price', 'total', 'amount', 'sum', 'value', 'cost', 'total_price', 'totalPrice', 'calculated_price', 'calculatedPrice') as $price_key) {
 		if (isset($response[$price_key]) && '' !== $response[$price_key]) {
 			return array(
 				'price' => $response[$price_key],
