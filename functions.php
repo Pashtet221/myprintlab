@@ -1958,6 +1958,16 @@ add_action('wp_enqueue_scripts', function () {
 
 	$(document).on('change input', 'form.cart input, form.cart select, form.cart textarea, form.variations_form input, form.variations_form select, form.variations_form textarea', schedulePriceRequest);
 	$(document).on('found_variation reset_data woocommerce_variation_has_changed', 'form.variations_form', schedulePriceRequest);
+
+	$(function () {
+		var $form = $('form.cart, form.variations_form').first();
+
+		if ($form.length) {
+			window.setTimeout(function () {
+				requestPrice($form);
+			}, 450);
+		}
+	});
 })(jQuery);
 JS;
 
@@ -1998,26 +2008,32 @@ function myprintlab_calculate_print_price() {
 
 	$body = wp_remote_retrieve_body($response);
 	$decoded = json_decode($body, true);
-	$price = null;
+	$result = myprintlab_extract_price_from_webhook_response(null === $decoded ? $body : $decoded);
 
-	if (is_array($decoded)) {
-		if (!empty($decoded['price_html'])) {
-			wp_send_json_success(array(
-				'price' => $decoded['price'] ?? null,
-				'price_html' => wp_kses_post($decoded['price_html']),
-				'raw' => $decoded,
-			));
-		}
-
-		$price = $decoded['price'] ?? $decoded['total'] ?? $decoded['amount'] ?? null;
-	} elseif (is_numeric(trim($body))) {
-		$price = trim($body);
+	if (!empty($result['error'])) {
+		wp_send_json_success(array(
+			'price' => null,
+			'price_html' => '',
+			'message' => $result['error'],
+			'raw' => $decoded ?: $body,
+		));
 	}
+
+	if (!empty($result['price_html'])) {
+		wp_send_json_success(array(
+			'price' => $result['price'],
+			'price_html' => wp_kses_post($result['price_html']),
+			'raw' => $decoded ?: $body,
+		));
+	}
+
+	$price = $result['price'];
 
 	if (null === $price || '' === $price) {
 		wp_send_json_success(array(
 			'price' => null,
 			'price_html' => '',
+			'message' => 'Webhook не вернул цену. Ожидаются поля price_html, price, total или amount.',
 			'raw' => $decoded ?: $body,
 		));
 	}
@@ -2031,4 +2047,92 @@ function myprintlab_calculate_print_price() {
 		'price_html' => $price_html,
 		'raw' => $decoded ?: $body,
 	));
+}
+
+function myprintlab_extract_price_from_webhook_response($response) {
+	if (is_string($response)) {
+		$trimmed = trim($response);
+
+		if ('' === $trimmed) {
+			return array(
+				'price' => null,
+				'price_html' => '',
+				'error' => 'Webhook вернул пустой ответ.',
+			);
+		}
+
+		if (is_numeric($trimmed)) {
+			return array(
+				'price' => $trimmed,
+				'price_html' => '',
+				'error' => '',
+			);
+		}
+
+		return array(
+			'price' => null,
+			'price_html' => '',
+			'error' => $trimmed,
+		);
+	}
+
+	if (!is_array($response)) {
+		return array(
+			'price' => null,
+			'price_html' => '',
+			'error' => 'Webhook вернул неподдерживаемый формат ответа.',
+		);
+	}
+
+	foreach (array('price_html', 'priceHtml', 'formatted_price', 'formattedPrice') as $html_key) {
+		if (!empty($response[$html_key])) {
+			return array(
+				'price' => $response['price'] ?? $response['total'] ?? $response['amount'] ?? null,
+				'price_html' => (string) $response[$html_key],
+				'error' => '',
+			);
+		}
+	}
+
+	foreach (array('price', 'total', 'amount', 'sum', 'value') as $price_key) {
+		if (isset($response[$price_key]) && '' !== $response[$price_key]) {
+			return array(
+				'price' => $response[$price_key],
+				'price_html' => '',
+				'error' => '',
+			);
+		}
+	}
+
+	foreach (array('data', 'result', 'body', 'json', 'output') as $nested_key) {
+		if (isset($response[$nested_key])) {
+			$nested_result = myprintlab_extract_price_from_webhook_response($response[$nested_key]);
+
+			if (empty($nested_result['error']) && (null !== $nested_result['price'] || '' !== $nested_result['price_html'])) {
+				return $nested_result;
+			}
+		}
+	}
+
+	if (isset($response[0])) {
+		$first_result = myprintlab_extract_price_from_webhook_response($response[0]);
+
+		if (empty($first_result['error']) && (null !== $first_result['price'] || '' !== $first_result['price_html'])) {
+			return $first_result;
+		}
+	}
+
+	if (!empty($response['message'])) {
+		return array(
+			'price' => null,
+			'price_html' => '',
+			'error' => (string) $response['message'],
+		);
+	}
+
+	return array(
+		'price' => null,
+		'price_html' => '',
+		'error' => 'Webhook не вернул цену. Ожидаются поля price_html, price, total или amount.',
+	);
 }
