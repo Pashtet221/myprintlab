@@ -1973,6 +1973,7 @@ add_action('wp_enqueue_scripts', function () {
 				payload: JSON.stringify(payload)
 			}
 		}).done(renderPrice).fail(function (xhr) {
+			lastPayloadHash = '';
 			var message = xhr && xhr.responseJSON && xhr.responseJSON.data && xhr.responseJSON.data.message ? xhr.responseJSON.data.message : 'Не удалось получить актуальную стоимость.';
 			showPriceMessage(message, true);
 		}).always(function () {
@@ -1997,15 +1998,10 @@ add_action('wp_enqueue_scripts', function () {
 	$(document).on('change input', 'form.cart input, form.cart select, form.cart textarea, form.variations_form input, form.variations_form select, form.variations_form textarea', schedulePriceRequest);
 	$(document).on('found_variation reset_data woocommerce_variation_has_changed', 'form.variations_form', schedulePriceRequest);
 
-	$(function () {
-		var $form = $('form.cart, form.variations_form').first();
-
-		if ($form.length) {
-			window.setTimeout(function () {
-				requestPrice($form);
-			}, 450);
-		}
-	});
+	// Не дергаем webhook сразу при загрузке карточки: на первом рендере
+	// параметры могут быть еще не выбраны, а n8n в таком случае возвращает 500.
+	// Расчет запускается только после изменения пользователем полей товара
+	// или события WooCommerce о подобранной вариации.
 })(jQuery);
 JS;
 
