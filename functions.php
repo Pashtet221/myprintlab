@@ -2051,7 +2051,7 @@ function myprintlab_calculate_print_price() {
 
 	if (200 > $status_code || 300 <= $status_code) {
 		wp_send_json_error(array(
-			'message' => sprintf('Webhook вернул HTTP %d. Проверьте сценарий расчета.', $status_code),
+			'message' => myprintlab_get_print_price_webhook_error_message($status_code, $body),
 			'raw' => $body,
 		), 502);
 	}
@@ -2092,6 +2092,29 @@ function myprintlab_calculate_print_price() {
 		'price_html' => $price_html,
 		'raw' => $decoded ?: $body,
 	));
+}
+
+
+function myprintlab_get_print_price_webhook_error_message($status_code, $body) {
+	$default_message = sprintf('Webhook вернул HTTP %d. Проверьте активность workflow n8n и что webhook принимает POST-запросы.', $status_code);
+	$decoded_body = json_decode((string) $body, true);
+	$n8n_message = '';
+
+	if (is_array($decoded_body) && !empty($decoded_body['message'])) {
+		$n8n_message = (string) $decoded_body['message'];
+	} elseif (is_string($body) && '' !== trim($body)) {
+		$n8n_message = trim($body);
+	}
+
+	if ('' === $n8n_message) {
+		return $default_message;
+	}
+
+	if (false !== stripos($n8n_message, 'not registered for GET') || false !== stripos($n8n_message, 'POST request')) {
+		return 'Webhook n8n зарегистрирован только для POST-запросов. Это нормально, что при открытии ссылки в браузере (GET) n8n показывает 404; расчет на сайте отправляет POST через WordPress. Если ошибка появляется на сайте, проверьте, что workflow n8n активен и в узле Webhook разрешен метод POST.';
+	}
+
+	return $default_message . ' Ответ webhook: ' . $n8n_message;
 }
 
 function myprintlab_extract_price_from_webhook_response($response) {
